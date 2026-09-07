@@ -8,13 +8,19 @@
  * 默认播放随插件内置的音效（assets/fart.mp3）；通过 cordis.patch.yml 的
  * config.soundPath 可换成任意 WAV/MP3 文件（内置音效可被替换）。
  *
- * 播放通过 Windows PowerShell 完成：WAV 走 System.Media.SoundPlayer
- * （PlaySync 精确阻塞至播完），MP3 等其他格式走 WPF 的
- * System.Windows.Media.MediaPlayer（异步播放后轮询到播完）。不依赖任何
- * 第三方 npm 包。
+ * 播放策略（config.playback）：
+ * - mci（首选）：在 worker 线程内用 koffi 直接调用 Windows 自带
+ *   winmm.dll 的 MCI 接口播放。全程进程内完成，不启动子进程、不调用
+ *   Shell/PowerShell、不执行脚本，不会被杀毒软件拦截。
+ * - powershell：旧方案，通过 PowerShell（SoundPlayer / WPF MediaPlayer）
+ *   播放，部分杀毒软件会拦截，仅作回退。
+ * - auto（默认）：优先 MCI，koffi 不可用时回退到 PowerShell。
+ *
+ * koffi 是 DSH 桌面端自带的原生 FFI 库（profiles 共享依赖），无需额外安装。
  */
 
 import { spawn } from 'node:child_process'
+import { Worker } from 'node:worker_threads'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
@@ -30,12 +36,20 @@ const QUESTION_TOOLS = Object.freeze([
 /** 随插件内置的默认音效（与 index.js 同目录的 assets/fart.mp3）。 */
 const BUNDLED_SOUND = fileURLToPath(new URL('./assets/fart.mp3', import.meta.url))
 
+/** MCI 播放 worker 脚本（与 index.js 同目录）。 */
+const MCI_WORKER = new URL('./play-mci.worker.js', import.meta.url)
+
+/** MCI 播放兜底超时（毫秒）：worker 卡住时强制终止，避免 playing 卡死。 */
+const MCI_TIMEOUT_MS = 32000
+
 /** 默认配置：与 cordis.patch.yml 的 config 块合并（patch 优先）。 */
 const DEFAULTS = Object.freeze({
   /** 总开关：false 时完全不加载提醒监听。 */
   enabled: true,
   /** 提示音效文件路径（WAV/MP3）；省略时使用内置音效，可改为自己的文件路径以替换。 */
   soundPath: BUNDLED_SOUND,
+  /** 播放后端：'auto'（默认，优先 MCI）| 'mci' | 'powershell'。 */
+  playback: 'auto',
   /** 需要用户授予权限时播放。 */
   playOnApproval: true,
   /** 需要用户选择/确认（提问、计划审核）时播放。 */
@@ -104,7 +118,7 @@ function soundIsPlayable(soundPath) {
     const lower = String(soundPath).toLowerCase()
     if (lower.endsWith('.wav')) return wavDataBytes(soundPath) > 0
     if (lower.endsWith('.mp3')) return mp3IsPlayable(soundPath)
-    // 其他扩展名：文件非空即尝试播放（WPF MediaPlayer 支持常见音频格式）。
+    // 其他扩展名：文件非空即尝试播放（MCI 支持常见音频格式）。
     return true
   } catch {
     return false
@@ -117,8 +131,9 @@ function powerShellExecutable() {
 }
 
 /**
- * 构建播放 MP3 等非 WAV 音频的 PowerShell 命令：WPF MediaPlayer 异步播放，
- * 轮询直到播完（NaturalDuration 可得时）或超时（30 秒）退出。
+ * 构建播放 MP3 等非 WAV 音频的 PowerShell 命令（仅回退方案）：WPF
+ * MediaPlayer 异步播放，轮询直到播完（NaturalDuration 可得时）或超时
+ * （30 秒）退出。
  * @param soundPath - 已校验可播放的音频文件路径。
  * @returns PowerShell 命令字符串。
  */
@@ -140,11 +155,11 @@ function mediaPlayerCommand(soundPath) {
 }
 
 /**
- * 异步启动一个隐藏的 PowerShell 进程播放音效。
+ * 回退方案：异步启动一个隐藏的 PowerShell 进程播放音效。
  * @param soundPath - 已校验可播放的音频文件路径。
- * @returns 子进程句柄。
+ * @returns 子进程句柄（ChildProcess）。
  */
-function playSound(soundPath) {
+function playViaPowershell(soundPath) {
   const quoted = `'${String(soundPath).replace(/'/g, "''")}'`
   const lower = String(soundPath).toLowerCase()
   // WAV 用 SoundPlayer 的 PlaySync（精确阻塞至播完）；其余格式用 WPF MediaPlayer。
@@ -162,6 +177,57 @@ function playSound(soundPath) {
   })
 }
 
+/** koffi 是否可用（惰性探测，结果缓存）。 */
+let mciAvailable = null
+async function mciPlaybackAvailable() {
+  if (mciAvailable !== null) return mciAvailable
+  try {
+    await import('koffi')
+    mciAvailable = true
+  } catch {
+    mciAvailable = false
+  }
+  return mciAvailable
+}
+
+/**
+ * 首选方案：在 worker 线程内用 koffi + winmm.dll（MCI）播放音效。
+ * 进程内完成，无子进程/Shell/PowerShell，杀毒软件不会拦截。返回 Worker，
+ * 沿用与子进程一致的 'error'/'exit' 事件接口；播放失败经 'message' 上报。
+ * @param soundPath - 已校验可播放的音频文件路径。
+ * @param logger - 日志对象。
+ * @returns worker 实例（Worker）。
+ */
+function playViaMci(soundPath, logger) {
+  const worker = new Worker(MCI_WORKER, {
+    workerData: { soundPath },
+    name: 'fart-alert-mci',
+  })
+  worker.once('message', (message) => {
+    if (message && message.ok === false) {
+      logger.warn?.(`[fart-alert] MCI 播放失败: ${message.error ?? '未知错误'}`)
+    }
+  })
+  const timer = setTimeout(() => {
+    worker.terminate().catch(() => {})
+  }, MCI_TIMEOUT_MS)
+  worker.once('exit', () => clearTimeout(timer))
+  return worker
+}
+
+/**
+ * 按 playback 配置分发到对应播放后端。
+ * @param soundPath - 已校验可播放的音频文件路径。
+ * @param cfg - 合并后的插件配置。
+ * @param logger - 日志对象。
+ * @returns Worker 或 ChildProcess（均带 'error'/'exit' 事件）。
+ */
+async function playSound(soundPath, cfg, logger) {
+  if (cfg.playback === 'powershell') return playViaPowershell(soundPath)
+  if (cfg.playback === 'mci' || (await mciPlaybackAvailable())) return playViaMci(soundPath, logger)
+  return playViaPowershell(soundPath)
+}
+
 export function apply(ctx, config = {}) {
   const cfg = resolveConfig(config)
   const logger = ctx.logger ?? console
@@ -174,7 +240,7 @@ export function apply(ctx, config = {}) {
   let lastPlayedAt = 0
   let playing = false
 
-  const trigger = () => {
+  const trigger = async () => {
     if (playing) return
     const now = Date.now()
     if (now - lastPlayedAt < cfg.minIntervalMs) return
@@ -187,10 +253,17 @@ export function apply(ctx, config = {}) {
     }
     lastPlayedAt = now
     playing = true
-    const child = playSound(cfg.soundPath)
+    let child
+    try {
+      child = await playSound(cfg.soundPath, cfg, logger)
+    } catch (error) {
+      playing = false
+      logger.warn?.(`[fart-alert] 启动播放失败: ${error?.message ?? error}`)
+      return
+    }
     child.once('error', (error) => {
       playing = false
-      logger.warn?.(`[fart-alert] 启动 PowerShell 播放失败: ${error.message}`)
+      logger.warn?.(`[fart-alert] 播放进程异常: ${error?.message ?? error}`)
     })
     child.once('exit', () => {
       playing = false
@@ -209,6 +282,11 @@ export function apply(ctx, config = {}) {
       if (QUESTION_TOOLS.includes(toolName)) trigger()
     }
   }, { global: true })
+
+  // 启动时探测并记录播放后端。
+  mciPlaybackAvailable().then((ok) => {
+    logger.info?.(`[fart-alert] 播放后端：${ok ? 'MCI (koffi+winmm，进程内)' : 'PowerShell（回退）'}`)
+  }).catch(() => {})
 
   logger.info?.('[fart-alert] 已启用：授权/选择时播放放屁音效提醒')
 

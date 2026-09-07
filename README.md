@@ -43,6 +43,7 @@
       config:
         enabled: true              # 总开关
         soundPath: 'D:\my-sounds\fart.wav' # 音效文件路径（WAV/MP3，省略=内置）
+        playback: 'auto'           # 播放后端：auto（默认，优先 MCI）| mci | powershell
         playOnApproval: true       # 需要授予权限时播放
         playOnQuestion: true       # 需要选择/确认时播放
         minIntervalMs: 2000        # 两次播放最短间隔（毫秒）
@@ -52,11 +53,12 @@
 
 ## 实现说明
 
-- 纯 Node 内置模块实现（`node:child_process` / `node:fs` / `node:url`），无第三方依赖。
+- 纯 Node 内置模块实现（`node:child_process` / `node:fs` / `node:url` / `node:worker_threads`），无第三方依赖。
+- **默认播放后端是 MCI**：在 worker 线程内用 `koffi`（DSH 桌面端自带的原生 FFI 库）直接调用 Windows 自带的 `winmm.dll` 播放音效。全程**进程内完成**——不启动子进程、不调用 Shell/PowerShell、不执行脚本，**不会被杀毒软件拦截**，也无需安装任何播放器。
+- 若 `koffi` 不可用（`config.playback: 'powershell'` 或自动回退），则退回旧方案：通过 PowerShell（`System.Media.SoundPlayer` / WPF `MediaPlayer`）播放。注意：部分杀毒软件会拦截 PowerShell 执行，所以仅作回退。
 - 默认音效通过 `import.meta.url` 定位到插件包内的 `assets/fart.mp3`，不依赖任何外部绝对路径。
-- 播放走 Windows PowerShell，隐藏窗口异步执行，不阻塞 DSH：WAV 用 `System.Media.SoundPlayer`（PlaySync 精确阻塞至播完），MP3 等其他格式用 WPF `System.Windows.Media.MediaPlayer`（异步播放后轮询到播完或超时）。
 - 订阅 `session/event` 全局事件流，不修改 DSH 内核任何行为。
-- 内置防堆叠：同一时刻只允许一个播放进程，且受 `minIntervalMs` 节流。
+- 内置防堆叠：同一时刻只允许一个播放，且受 `minIntervalMs` 节流。
 
 ## 许可证
 
