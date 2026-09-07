@@ -1,0 +1,8 @@
+{
+  "name": "fart-alert",
+  "version": "1.0.0",
+  "description": "当 DSH 需要用户授予权限或进行选择时播放放屁音效提醒",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT"
+}

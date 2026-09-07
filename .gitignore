@@ -1,0 +1,6 @@
+# 依赖与构建产物
+node_modules/
+*.log
+
+# 本机专用脚本（含绝对路径，不随仓库发布）
+verify-install.mjs
