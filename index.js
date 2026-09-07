@@ -5,14 +5,18 @@
  * 选择/确认（ask_user_question / ask_user_vision 提问、exit_plan_mode
  * 计划审核）时，在电脑上播放放屁音效提醒用户。
  *
+ * 默认播放随插件内置的音效（assets/fart.mp3）；通过 cordis.patch.yml 的
+ * config.soundPath 可换成任意 WAV/MP3 文件（内置音效可被替换）。
+ *
  * 播放通过 Windows PowerShell 完成：WAV 走 System.Media.SoundPlayer
  * （PlaySync 精确阻塞至播完），MP3 等其他格式走 WPF 的
  * System.Windows.Media.MediaPlayer（异步播放后轮询到播完）。不依赖任何
- * 第三方 npm 包；音效文件路径可通过 cordis.patch.yml 的 config 修改。
+ * 第三方 npm 包。
  */
 
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, statSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
 export const name = 'fart-alert'
 
@@ -23,12 +27,15 @@ const QUESTION_TOOLS = Object.freeze([
   'exit_plan_mode',
 ])
 
+/** 随插件内置的默认音效（与 index.js 同目录的 assets/fart.mp3）。 */
+const BUNDLED_SOUND = fileURLToPath(new URL('./assets/fart.mp3', import.meta.url))
+
 /** 默认配置：与 cordis.patch.yml 的 config 块合并（patch 优先）。 */
 const DEFAULTS = Object.freeze({
   /** 总开关：false 时完全不加载提醒监听。 */
   enabled: true,
-  /** 提示音效文件路径（WAV/MP3）。 */
-  soundPath: 'G:\\放屁音效.mp3',
+  /** 提示音效文件路径（WAV/MP3）；省略时使用内置音效，可改为自己的文件路径以替换。 */
+  soundPath: BUNDLED_SOUND,
   /** 需要用户授予权限时播放。 */
   playOnApproval: true,
   /** 需要用户选择/确认（提问、计划审核）时播放。 */
